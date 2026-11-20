@@ -13,45 +13,54 @@
 # limitations under the License.
 #
 
-while ! test -e "/dev/block/mapper/vendor";
-do
-  sleep 1;
-done;
+exec >> /tmp/extract_ta.log 2>&1
 
-mkdir -p "/tmp/vendor";
-if mount -o ro "/dev/block/mapper/vendor" "/tmp/vendor"; then
-  mkdir -m 755 "/vendor/tee";
-  mkdir -m 755 "/vendor/tee/driver";
+vendor_dev=/dev/block/mapper/vendor
+while [ ! -e "$vendor_dev" ]; do
+  sleep 1
+done
 
-  model=$(getprop "ro.boot.em.model")
-  
-  if [ -d "/tmp/vendor/tee_$model" ]; then
-    tee_dir="/tmp/vendor/tee_$model"
-  else
-    tee_dir="/tmp/vendor/tee"
-  fi
+vendor_mount=$(mktemp -d /tmp/vendor-ta.XXXXXX) || exit 1
+trap 'rmdir "$vendor_mount"' EXIT
+if ! mount -t erofs -o ro "$vendor_dev" "$vendor_mount" &&
+   ! mount -t ext4 -o ro,noload "$vendor_dev" "$vendor_mount"; then
+  echo "Cannot mount the installed vendor partition"
+  exit 1
+fi
+trap 'umount "$vendor_mount" && rmdir "$vendor_mount"' EXIT
 
-  # Crypto Manager Driver
-  cp -p "$tee_dir/driver/00000000-0000-0000-0000-53626f786476" \
-    "/vendor/tee/driver/00000000-0000-0000-0000-53626f786476";
-  # ICCC Driver
-  cp -p "$tee_dir/driver/00000000-0000-0000-0000-494363447256" \
-    "/vendor/tee/driver/00000000-0000-0000-0000-494363447256";
-  # KeyMint TA
-  cp -p "$tee_dir/00000000-0000-0000-0000-4b45594d5354" \
-    "/vendor/tee/00000000-0000-0000-0000-4b45594d5354";
-  # TZ_ICCC TA
-  cp -p "$tee_dir/00000000-0000-0000-0000-0053545354ab" \
-    "/vendor/tee/00000000-0000-0000-0000-0053545354ab";
-  # Gatekeeper TA
-  cp -p "$tee_dir/00000000-0000-0000-0000-474154454b45" \
-    "/vendor/tee/00000000-0000-0000-0000-474154454b45";
-
-  umount "/tmp/vendor";
+model=$(getprop ro.boot.em.model)
+# crDroid and other unified builds keep each model's TAs under tee/<model>.
+if [ -n "$model" ] && [ -d "$vendor_mount/tee/$model" ]; then
+  tee_dir="$vendor_mount/tee/$model"
+elif [ -n "$model" ] && [ -d "$vendor_mount/tee_$model" ]; then
+  tee_dir="$vendor_mount/tee_$model"
+else
+  tee_dir="$vendor_mount/tee"
 fi
 
-rm -r "/tmp/vendor";
+# Crypto Manager driver, ICCC driver, KeyMint TA, TZ_ICCC TA, Gatekeeper TA.
+set -- driver/00000000-0000-0000-0000-53626f786476 \
+       driver/00000000-0000-0000-0000-494363447256 \
+       00000000-0000-0000-0000-4b45594d5354 \
+       00000000-0000-0000-0000-0053545354ab \
+       00000000-0000-0000-0000-474154454b45
 
-setprop "crypto.ready" "1";
+echo "Loading TEE files from $tee_dir (model: $model)"
+for file do
+  if [ ! -s "$tee_dir/$file" ]; then
+    echo "Missing or empty TEE file: $tee_dir/$file"
+    exit 1
+  fi
+done
 
-exit 0;
+# init starts services with umask 077; the TEE daemons run as system.
+umask 022
+mkdir -p /vendor/tee/driver || exit 1
+for file do
+  cp -p "$tee_dir/$file" "/vendor/tee/$file" || exit 1
+done
+
+umount "$vendor_mount" || exit 1
+trap 'rmdir "$vendor_mount"' EXIT
+setprop crypto.ready 1
